@@ -27,13 +27,13 @@ type params struct {
 type HanldleResp func(resp *http.Response, err error) error
 
 // NewHTTPClient is used to create new http client
-func NewHTTPClient(connTimeout, executeTimeout, keepAlive time.Duration, maxIdleConnsPerHost int) (*Client, error) {
+func NewHTTPClient(connTimeout, executeTimeout, tcpKeepAlive time.Duration, maxIdleConnsPerHost int) (*Client, error) {
 
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		Dial: (&net.Dialer{
 			Timeout:   connTimeout,
-			KeepAlive: keepAlive,
+			KeepAlive: tcpKeepAlive,
 		}).Dial,
 		MaxIdleConnsPerHost: maxIdleConnsPerHost,
 	}
