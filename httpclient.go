@@ -9,54 +9,74 @@ import (
 
 	"github.com/google/go-querystring/query"
 
+	"io"
+	"strings"
+
 	"golang.org/x/net/context"
 )
 
 // Client is used to send http request
 type Client struct {
-	Client *http.Client
+	Client      *http.Client
+	TraceIDKey  string
+	TraceHeader string
 }
 
 type params struct {
 	method      string
 	url         string
 	contentType string
+	accept      string
 	data        url.Values
+	body        io.Reader
 }
 
+// HanldleResp present result handler
 type HanldleResp func(resp *http.Response, err error) error
 
 // NewHTTPClient is used to create new http client
-func NewHTTPClient(connTimeout, executeTimeout, tcpKeepAlive time.Duration, maxIdleConnsPerHost int) (*Client, error) {
+func NewHTTPClient(connTimeout, endToEndTimeout time.Duration, maxIdleConnsPerHost int) (*Client, error) {
 
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		Dial: (&net.Dialer{
 			Timeout:   connTimeout,
-			KeepAlive: tcpKeepAlive,
+			KeepAlive: 30 * time.Second,
 		}).Dial,
 		MaxIdleConnsPerHost: maxIdleConnsPerHost,
 	}
 
 	httpClient := &http.Client{
 		Transport: transport,
-		Timeout:   executeTimeout,
+		Timeout:   endToEndTimeout,
 	}
 
 	hc := &Client{
-		Client: httpClient,
+		Client:      httpClient,
+		TraceIDKey:  "_TraceId_",
+		TraceHeader: "X-TraceID",
 	}
 	return hc, nil
 }
 
 // Get is used to invoke HTTP Get request
-func (c *Client) Get(logid string, ctx context.Context, url string, handler HanldleResp) error {
-	return c.coreHTTP(logid, ctx, params{method: "Get", url: url}, handler)
+func (c *Client) Get(ctx context.Context, url string, handler HanldleResp) error {
+	return c.coreHTTP(ctx, params{method: "Get", url: url}, handler)
+}
+
+// Post is used to invoke HTTP Post request
+func (c *Client) Post(ctx context.Context, url string, contentType string, body io.Reader, handler HanldleResp) error {
+	return c.coreHTTP(ctx, params{method: "Post", url: url, body: body, contentType: contentType}, handler)
+}
+
+// Put is used to invoke HTTP Put request
+func (c *Client) Put(ctx context.Context, url string, contentType string, body io.Reader, handler HanldleResp) error {
+	return c.coreHTTP(ctx, params{method: "Put", url: url, body: body, contentType: contentType}, handler)
 }
 
 // PostForm is used to invoke HTTP Post request in form content
-func (c *Client) PostForm(logid string, ctx context.Context, url string, data url.Values, handler HanldleResp) error {
-	return c.coreHTTP(logid, ctx, params{method: "Post", url: url, data: data}, handler)
+func (c *Client) PostForm(ctx context.Context, url string, data url.Values, handler HanldleResp) error {
+	return c.coreHTTP(ctx, params{method: "PostForm", url: url, data: data}, handler)
 }
 
 // ConstructQueryURL is used to construct query string and encode params
@@ -81,10 +101,10 @@ func constructQueryString(data interface{}) (string, error) {
 	return v.Encode(), nil
 }
 
-func (c *Client) coreHTTP(logid string, ctx context.Context, p params, handler HanldleResp) error {
+func (c *Client) coreHTTP(ctx context.Context, p params, handler HanldleResp) error {
 
 	resultChan := make(chan error, 1)
-	go func() { resultChan <- handler(c.doParam(logid, p)) }()
+	go func() { resultChan <- handler(c.doParam(ctx, p)) }()
 	select {
 	case <-ctx.Done():
 		<-resultChan
@@ -95,14 +115,42 @@ func (c *Client) coreHTTP(logid string, ctx context.Context, p params, handler H
 
 }
 
-func (c *Client) doParam(logid string, p params) (*http.Response, error) {
+func (c *Client) doParam(ctx context.Context, p params) (*http.Response, error) {
+	var (
+		req         *http.Request
+		err         error
+		contentType string
+		accept      string
+	)
 	switch p.method {
 	case "Get":
-		return c.Client.Get(p.url)
+		req, err = http.NewRequest("GET", p.url, p.body)
 	case "Head":
-		return c.Client.Head(p.url)
+		req, err = http.NewRequest("HEAD", p.url, p.body)
 	case "Post":
-		return c.Client.PostForm(p.url, p.data)
+		req, err = http.NewRequest("POST", p.url, p.body)
+	case "Patch":
+		req, err = http.NewRequest("Patch", p.url, p.body)
+	case "PostForm":
+		req, err = http.NewRequest("POST", p.url, strings.NewReader(p.data.Encode()))
+		contentType = "application/x-www-form-urlencoded"
+	case "Put":
+		req, err = http.NewRequest("PUT", p.url, p.body)
+	default:
+		return nil, fmt.Errorf("Unsupport method: %s", p.method)
 	}
-	return nil, fmt.Errorf("%s unsupport method: %s", logid, p.method)
+	if err != nil {
+		return nil, err
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	if accept != "" {
+		req.Header.Set("Accept", accept)
+	}
+	traceID := ctx.Value(c.TraceIDKey)
+	if traceID != nil {
+		req.Header.Set(c.TraceHeader, traceID.(string))
+	}
+	return c.Client.Do(req)
 }
