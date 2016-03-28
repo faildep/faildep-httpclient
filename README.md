@@ -1,6 +1,6 @@
 # httpclient
 
-just a wrapper and focus on some vital config parameters.
+http wrapper with fault tolerance support
 
     import "github.com/lysu/httpclient"
 
