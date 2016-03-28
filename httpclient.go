@@ -9,17 +9,59 @@ import (
 
 	"github.com/google/go-querystring/query"
 
+	"github.com/lysu/slb"
+	"golang.org/x/net/context"
 	"io"
 	"strings"
-
-	"golang.org/x/net/context"
 )
+
+type httpConf struct {
+	maxIdlePerSever         int
+	successiveFailThreshold uint
+	trippedBaseTime         time.Duration
+	trippedTimeMax          time.Duration
+	trippedBackOff          slb.BackOff
+	retryMaxServerPick      uint
+	retryMaxRetryPerServer  uint
+	retryBaseInterval       time.Duration
+	retryMaxInterval        time.Duration
+	retryBackOff            slb.BackOff
+	rwTimeout               time.Duration
+}
+
+const (
+	DefaultSuccessiveFailThreshold = 5
+	DefaultTrippedBaseTime         = 20 * time.Millisecond
+	DefaultTrippedTimeMax          = 100 * time.Millisecond
+	DefaultRetryMaxServerPick      = 3
+	DefaultRetryMaxRetryPerServer  = 0
+	DefaultRetryBaseInterval       = 10 * time.Millisecond
+	DefaultRetryMaxInterval        = 50 * time.Millisecond
+)
+
+// WithBreak config http failure break params.
+func WithBreaker(successiveFailThreshold uint, trippedBaseTime, trippedTimeMax time.Duration) func(o *httpConf) {
+	return func(conf *httpConf) {
+		conf.successiveFailThreshold = successiveFailThreshold
+		conf.trippedBaseTime = trippedBaseTime
+		conf.trippedTimeMax = trippedTimeMax
+	}
+}
+
+// WithRetry config http retry params.
+func WithRetry(retryMaxServerPick, retryMaxPerServer uint, retryBaseInterval, retryMaxInterval time.Duration) func(o *httpConf) {
+	return func(conf *httpConf) {
+		conf.retryMaxServerPick = retryMaxServerPick
+		conf.retryMaxRetryPerServer = retryMaxPerServer
+		conf.retryBaseInterval = retryBaseInterval
+		conf.retryMaxInterval = retryMaxInterval
+	}
+}
 
 // Client is used to send http request
 type Client struct {
-	Client      *http.Client
-	TraceIDKey  string
-	TraceHeader string
+	Client       *http.Client
+	LoadBalancer *slb.LoadBalancer
 }
 
 type params struct {
@@ -31,11 +73,10 @@ type params struct {
 	body        io.Reader
 }
 
-// HanldleResp present result handler
-type HanldleResp func(resp *http.Response, err error) error
+type HanldleResp func(resp *http.Response) error
 
-// NewHTTPClient is used to create new http client
-func NewHTTPClient(connTimeout, endToEndTimeout time.Duration, maxIdleConnsPerHost int) (*Client, error) {
+// NewHTTP is used to create new http client
+func NewHTTP(hosts []string, connTimeout, endToEndTimeout time.Duration, maxIdleConnsPerHost int, opts ...func(o *httpConf)) *Client {
 
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
@@ -51,32 +92,66 @@ func NewHTTPClient(connTimeout, endToEndTimeout time.Duration, maxIdleConnsPerHo
 		Timeout:   endToEndTimeout,
 	}
 
-	hc := &Client{
-		Client:      httpClient,
-		TraceIDKey:  "_TraceId_",
-		TraceHeader: "X-TraceID",
+	return NewHTTPWithClient(httpClient, hosts, opts...)
+}
+
+// NewHTTPWithClient is used to create new client base on exists client for reuse connection pool.
+func NewHTTPWithClient(client *http.Client, hosts []string, opts ...func(o *httpConf)) *Client {
+
+	conf := httpConf{
+		successiveFailThreshold: DefaultSuccessiveFailThreshold,
+		trippedBaseTime:         DefaultTrippedBaseTime,
+		trippedTimeMax:          DefaultTrippedTimeMax,
+		trippedBackOff:          slb.Exponential,
+		retryMaxServerPick:      DefaultRetryMaxServerPick,
+		retryMaxRetryPerServer:  DefaultRetryMaxRetryPerServer,
+		retryBaseInterval:       DefaultRetryBaseInterval,
+		retryMaxInterval:        DefaultRetryMaxInterval,
+		retryBackOff:            slb.DecorrelatedJittered,
 	}
-	return hc, nil
+
+	for _, opt := range opts {
+		opt(&conf)
+	}
+
+	slb := slb.NewLoadBalancer(hosts,
+		slb.WithCircuitBreaker(conf.successiveFailThreshold, conf.trippedBaseTime, conf.trippedTimeMax, conf.trippedBackOff),
+		slb.WithRetry(conf.retryMaxServerPick, conf.retryMaxRetryPerServer, conf.retryBaseInterval, conf.retryMaxInterval, conf.retryBackOff),
+	)
+
+	hc := &Client{
+		Client:       client,
+		LoadBalancer: slb,
+	}
+	return hc
 }
 
 // Get is used to invoke HTTP Get request
 func (c *Client) Get(ctx context.Context, url string, handler HanldleResp) error {
-	return c.coreHTTP(ctx, params{method: "Get", url: url}, handler)
+	return c.LoadBalancer.Submit(func(node *slb.Node) error {
+		return c.coreHTTP(ctx, params{method: "Get", url: concatURL(node.Server, url)}, handler)
+	})
 }
 
 // Post is used to invoke HTTP Post request
 func (c *Client) Post(ctx context.Context, url string, contentType string, body io.Reader, handler HanldleResp) error {
-	return c.coreHTTP(ctx, params{method: "Post", url: url, body: body, contentType: contentType}, handler)
+	return c.LoadBalancer.Submit(func(node *slb.Node) error {
+		return c.coreHTTP(ctx, params{method: "Post", url: concatURL(node.Server, url), body: body, contentType: contentType}, handler)
+	})
 }
 
 // Put is used to invoke HTTP Put request
 func (c *Client) Put(ctx context.Context, url string, contentType string, body io.Reader, handler HanldleResp) error {
-	return c.coreHTTP(ctx, params{method: "Put", url: url, body: body, contentType: contentType}, handler)
+	return c.LoadBalancer.Submit(func(node *slb.Node) error {
+		return c.coreHTTP(ctx, params{method: "Put", url: concatURL(node.Server, url), body: body, contentType: contentType}, handler)
+	})
 }
 
 // PostForm is used to invoke HTTP Post request in form content
 func (c *Client) PostForm(ctx context.Context, url string, data url.Values, handler HanldleResp) error {
-	return c.coreHTTP(ctx, params{method: "PostForm", url: url, data: data}, handler)
+	return c.LoadBalancer.Submit(func(node *slb.Node) error {
+		return c.coreHTTP(ctx, params{method: "PostForm", url: concatURL(node.Server, url), data: data}, handler)
+	})
 }
 
 // ConstructQueryURL is used to construct query string and encode params
@@ -93,6 +168,10 @@ func ConstructURL(protocol, host, url string) string {
 	return fmt.Sprintf("%s://%s%s", protocol, host, url)
 }
 
+func concatURL(host string, url string) string {
+	return host + url
+}
+
 func constructQueryString(data interface{}) (string, error) {
 	v, err := query.Values(data)
 	if err != nil {
@@ -104,7 +183,14 @@ func constructQueryString(data interface{}) (string, error) {
 func (c *Client) coreHTTP(ctx context.Context, p params, handler HanldleResp) error {
 
 	resultChan := make(chan error, 1)
-	go func() { resultChan <- handler(c.doParam(ctx, p)) }()
+	go func() {
+		resp, err := c.doParam(ctx, p)
+		if err != nil {
+			resultChan <- err
+			return
+		}
+		resultChan <- handler(resp)
+	}()
 	select {
 	case <-ctx.Done():
 		<-resultChan
@@ -147,10 +233,6 @@ func (c *Client) doParam(ctx context.Context, p params) (*http.Response, error) 
 	}
 	if accept != "" {
 		req.Header.Set("Accept", accept)
-	}
-	traceID := ctx.Value(c.TraceIDKey)
-	if traceID != nil {
-		req.Header.Set(c.TraceHeader, traceID.(string))
 	}
 	return c.Client.Do(req)
 }
