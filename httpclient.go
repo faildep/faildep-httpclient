@@ -78,26 +78,6 @@ type HanldleResp func(resp *http.Response) error
 // NewHTTP is used to create new http client
 func NewHTTP(hosts []string, connTimeout, endToEndTimeout time.Duration, maxIdleConnsPerHost int, opts ...func(o *httpConf)) *Client {
 
-	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		Dial: (&net.Dialer{
-			Timeout:   connTimeout,
-			KeepAlive: 30 * time.Second,
-		}).Dial,
-		MaxIdleConnsPerHost: maxIdleConnsPerHost,
-	}
-
-	httpClient := &http.Client{
-		Transport: transport,
-		Timeout:   endToEndTimeout,
-	}
-
-	return NewHTTPWithClient(httpClient, hosts, opts...)
-}
-
-// NewHTTPWithClient is used to create new client base on exists client for reuse connection pool.
-func NewHTTPWithClient(client *http.Client, hosts []string, opts ...func(o *httpConf)) *Client {
-
 	conf := httpConf{
 		successiveFailThreshold: DefaultSuccessiveFailThreshold,
 		trippedBaseTime:         DefaultTrippedBaseTime,
@@ -114,43 +94,91 @@ func NewHTTPWithClient(client *http.Client, hosts []string, opts ...func(o *http
 		opt(&conf)
 	}
 
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		Dial: (&net.Dialer{
+			Timeout:   connTimeout,
+			KeepAlive: 30 * time.Second,
+		}).Dial,
+		MaxIdleConnsPerHost: maxIdleConnsPerHost,
+	}
+
+	httpClient := &http.Client{
+		Transport: transport,
+		Timeout:   endToEndTimeout,
+	}
+
 	slb := slb.NewLoadBalancer(hosts,
 		slb.WithCircuitBreaker(conf.successiveFailThreshold, conf.trippedBaseTime, conf.trippedTimeMax, conf.trippedBackOff),
 		slb.WithRetry(conf.retryMaxServerPick, conf.retryMaxRetryPerServer, conf.retryBaseInterval, conf.retryMaxInterval, conf.retryBackOff),
 	)
 
 	hc := &Client{
-		Client:       client,
+		Client:       httpClient,
 		LoadBalancer: slb,
 	}
 	return hc
 }
 
+// WithContentType modify request contentType header
+func WithContentType(contentType string) func(p *params) {
+	return func(p *params) {
+		p.contentType = contentType
+	}
+}
+
+// WithAccept modify request accept header
+func WithAccept(accept string) func(p *params) {
+	return func(p *params) {
+		p.accept = accept
+	}
+}
+
 // Get is used to invoke HTTP Get request
-func (c *Client) Get(ctx context.Context, url string, handler HanldleResp) error {
+func (c *Client) Get(ctx context.Context, url string, handler HanldleResp, opts ...func(p *params)) error {
+	p := params{method: "Get"}
+	for _, opt := range opts {
+		opt(&p)
+	}
 	return c.LoadBalancer.Submit(func(node *slb.Node) error {
-		return c.coreHTTP(ctx, params{method: "Get", url: concatURL(node.Server, url)}, handler)
+		p.url = concatURL(node.Server, url)
+		return c.coreHTTP(ctx, p, handler)
 	})
 }
 
 // Post is used to invoke HTTP Post request
-func (c *Client) Post(ctx context.Context, url string, contentType string, body io.Reader, handler HanldleResp) error {
+func (c *Client) Post(ctx context.Context, url string, body io.Reader, handler HanldleResp, opts ...func(p *params)) error {
+	p := params{method: "Post", body: body}
+	for _, opt := range opts {
+		opt(&p)
+	}
 	return c.LoadBalancer.Submit(func(node *slb.Node) error {
-		return c.coreHTTP(ctx, params{method: "Post", url: concatURL(node.Server, url), body: body, contentType: contentType}, handler)
+		p.url = concatURL(node.Server, url)
+		return c.coreHTTP(ctx, p, handler)
 	})
 }
 
 // Put is used to invoke HTTP Put request
-func (c *Client) Put(ctx context.Context, url string, contentType string, body io.Reader, handler HanldleResp) error {
+func (c *Client) Put(ctx context.Context, url string, body io.Reader, handler HanldleResp, opts ...func(p *params)) error {
+	p := params{method: "Put", body: body}
+	for _, opt := range opts {
+		opt(&p)
+	}
 	return c.LoadBalancer.Submit(func(node *slb.Node) error {
-		return c.coreHTTP(ctx, params{method: "Put", url: concatURL(node.Server, url), body: body, contentType: contentType}, handler)
+		p.url = concatURL(node.Server, url)
+		return c.coreHTTP(ctx, p, handler)
 	})
 }
 
 // PostForm is used to invoke HTTP Post request in form content
-func (c *Client) PostForm(ctx context.Context, url string, data url.Values, handler HanldleResp) error {
+func (c *Client) PostForm(ctx context.Context, url string, data url.Values, handler HanldleResp, opts ...func(p *params)) error {
+	p := params{method: "PostForm", data: data}
+	for _, opt := range opts {
+		opt(&p)
+	}
 	return c.LoadBalancer.Submit(func(node *slb.Node) error {
-		return c.coreHTTP(ctx, params{method: "PostForm", url: concatURL(node.Server, url), data: data}, handler)
+		p.url = concatURL(node.Server, url)
+		return c.coreHTTP(ctx, p, handler)
 	})
 }
 
@@ -205,8 +233,8 @@ func (c *Client) doParam(ctx context.Context, p params) (*http.Response, error) 
 	var (
 		req         *http.Request
 		err         error
-		contentType string
-		accept      string
+		contentType string = p.contentType
+		accept      string = p.accept
 	)
 	switch p.method {
 	case "Get":
