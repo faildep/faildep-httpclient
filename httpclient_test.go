@@ -2,13 +2,13 @@ package httpclient_test
 
 import (
 	"fmt"
-	"github.com/lysu/httpclient"
 	"github.com/stretchr/testify/assert"
 	"golang.org/x/net/context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
+	"github.com/faildep/faildep-httpclient"
 )
 
 func TestRequestMultipleHosts(t *testing.T) {
@@ -32,7 +32,7 @@ func TestRequestMultipleHosts(t *testing.T) {
 	)
 
 	ctx := context.TODO()
-	for i := 0; i < 500; i++ {
+	for i := 0; i < 10; i++ {
 		err := hc.Get(ctx, "/", func(resp *http.Response) error {
 			assert.Equal(t, "sometime", resp.Header.Get("Last-Modified"))
 			return nil

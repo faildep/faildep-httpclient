@@ -9,10 +9,10 @@ import (
 
 	"github.com/google/go-querystring/query"
 
-	"github.com/lysu/slb"
 	"golang.org/x/net/context"
 	"io"
 	"strings"
+	"github.com/faildep/faildep"
 )
 
 type httpConf struct {
@@ -20,12 +20,12 @@ type httpConf struct {
 	successiveFailThreshold uint
 	trippedBaseTime         time.Duration
 	trippedTimeMax          time.Duration
-	trippedBackOff          slb.BackOff
+	trippedBackOff          faildep.BackOff
 	retryMaxServerPick      uint
 	retryMaxRetryPerServer  uint
 	retryBaseInterval       time.Duration
 	retryMaxInterval        time.Duration
-	retryBackOff            slb.BackOff
+	retryBackOff            faildep.BackOff
 	rwTimeout               time.Duration
 }
 
@@ -60,8 +60,8 @@ func WithRetry(retryMaxServerPick, retryMaxPerServer uint, retryBaseInterval, re
 
 // Client is used to send http request
 type Client struct {
-	Client       *http.Client
-	LoadBalancer *slb.LoadBalancer
+	Client  *http.Client
+	failDep *faildep.FailDep
 }
 
 type params struct {
@@ -82,12 +82,12 @@ func NewHTTP(hosts []string, connTimeout, endToEndTimeout time.Duration, maxIdle
 		successiveFailThreshold: DefaultSuccessiveFailThreshold,
 		trippedBaseTime:         DefaultTrippedBaseTime,
 		trippedTimeMax:          DefaultTrippedTimeMax,
-		trippedBackOff:          slb.Exponential,
+		trippedBackOff:          faildep.Exponential,
 		retryMaxServerPick:      DefaultRetryMaxServerPick,
 		retryMaxRetryPerServer:  DefaultRetryMaxRetryPerServer,
 		retryBaseInterval:       DefaultRetryBaseInterval,
 		retryMaxInterval:        DefaultRetryMaxInterval,
-		retryBackOff:            slb.DecorrelatedJittered,
+		retryBackOff:            faildep.DecorrelatedJittered,
 	}
 
 	for _, opt := range opts {
@@ -108,14 +108,14 @@ func NewHTTP(hosts []string, connTimeout, endToEndTimeout time.Duration, maxIdle
 		Timeout:   endToEndTimeout,
 	}
 
-	slb := slb.NewLoadBalancer(hosts,
-		slb.WithCircuitBreaker(conf.successiveFailThreshold, conf.trippedBaseTime, conf.trippedTimeMax, conf.trippedBackOff),
-		slb.WithRetry(conf.retryMaxServerPick, conf.retryMaxRetryPerServer, conf.retryBaseInterval, conf.retryMaxInterval, conf.retryBackOff),
+	f := faildep.NewFailDep(hosts,
+		faildep.WithCircuitBreaker(conf.successiveFailThreshold, conf.trippedBaseTime, conf.trippedTimeMax, conf.trippedBackOff),
+		faildep.WithRetry(conf.retryMaxServerPick, conf.retryMaxRetryPerServer, conf.retryBaseInterval, conf.retryMaxInterval, conf.retryBackOff),
 	)
 
 	hc := &Client{
 		Client:       httpClient,
-		LoadBalancer: slb,
+		failDep: f,
 	}
 	return hc
 }
@@ -140,8 +140,8 @@ func (c *Client) Get(ctx context.Context, url string, handler HanldleResp, opts 
 	for _, opt := range opts {
 		opt(&p)
 	}
-	return c.LoadBalancer.Submit(func(node *slb.Node) error {
-		p.url = concatURL(node.Server, url)
+	return c.failDep.Do(func(res *faildep.Resource) error {
+		p.url = concatURL(res.Server, url)
 		return c.coreHTTP(ctx, p, handler)
 	})
 }
@@ -152,8 +152,8 @@ func (c *Client) Post(ctx context.Context, url string, body io.Reader, handler H
 	for _, opt := range opts {
 		opt(&p)
 	}
-	return c.LoadBalancer.Submit(func(node *slb.Node) error {
-		p.url = concatURL(node.Server, url)
+	return c.failDep.Do(func(res *faildep.Resource) error {
+		p.url = concatURL(res.Server, url)
 		return c.coreHTTP(ctx, p, handler)
 	})
 }
@@ -164,8 +164,8 @@ func (c *Client) Put(ctx context.Context, url string, body io.Reader, handler Ha
 	for _, opt := range opts {
 		opt(&p)
 	}
-	return c.LoadBalancer.Submit(func(node *slb.Node) error {
-		p.url = concatURL(node.Server, url)
+	return c.failDep.Do(func(res *faildep.Resource) error {
+		p.url = concatURL(res.Server, url)
 		return c.coreHTTP(ctx, p, handler)
 	})
 }
@@ -176,8 +176,8 @@ func (c *Client) PostForm(ctx context.Context, url string, data url.Values, hand
 	for _, opt := range opts {
 		opt(&p)
 	}
-	return c.LoadBalancer.Submit(func(node *slb.Node) error {
-		p.url = concatURL(node.Server, url)
+	return c.failDep.Do(func(res *faildep.Resource) error {
+		p.url = concatURL(res.Server, url)
 		return c.coreHTTP(ctx, p, handler)
 	})
 }
